@@ -161,3 +161,4 @@ if len(y30):
     st.plotly_chart(f, use_container_width=True)
 
 st.caption("MACRODESK · free-data build · delayed quotes · not investment advice")
+
