@@ -31,7 +31,21 @@ fade, fade_msg = C.fade_rule(h)
 # ------------------------------------------------------------------ header
 st.title("🎯 MACRODESK")
 st.caption("Duration · geopolitics · crypto policy · one screen. "
-           "All free data. Cache 5–30 min — press R to refresh.")
+           "All free data. Cache 5–30 min — press R to refresh. "
+           "**New here? Open 📖 Guide in the sidebar.**")
+
+with st.expander("❓ What am I looking at? (30-second version)"):
+    st.markdown("""
+- **DURATION STRESS** — how hostile interest rates are to crypto.
+  Red = rallies tend to fail no matter what the news says.
+- **CHOKEPOINT** — how much war/oil risk is priced in.
+- **30Y ⭐** — the 30-year bond yield. The most important number on this page:
+  it's effectively crypto's discount rate. Stuck or rising = headwind.
+- **Red FADE banner** — crypto went up but bonds didn't agree. The move likely
+  won't last.
+
+Full explanations in **📖 Guide** (sidebar).
+""")
 
 # THE ONE RULE banner
 if fade:
