@@ -6,6 +6,10 @@ import streamlit.components.v1 as components
 import core as C
 
 st.set_page_config(page_title="Geopolitics & Hormuz", page_icon="🌍", layout="wide")
+
+if getattr(C, "VERSION", 1) < 2:
+    st.error("`core.py` is out of date — replace it in the repo root and push again.")
+    st.stop()
 st.title("🌍 Geopolitics & Hormuz")
 
 MAP_PRESETS = {
@@ -24,7 +28,7 @@ hor = C.hormuz_risk(h, g)
 k = st.columns(4)
 k[0].metric("CHOKEPOINT index", hor["index"] if hor["index"] is not None else "—")
 for i, key in enumerate(["BRENT", "WTI", "GOLD"], start=1):
-    s = h.get(C.TK[key], pd.Series(dtype=float)).dropna()
+    s = C.series(h, key)
     if len(s) > 1:
         k[i].metric(key.title(), f"${s.iloc[-1]:,.2f}",
                     f"{(s.iloc[-1]/s.iloc[-2]-1)*100:+.2f}%")
@@ -88,7 +92,7 @@ with tab_idx:
         st.area_chart(g.set_index("date")["vol"], height=240)
     st.subheader("Oil tape")
     cols = [C.TK["BRENT"], C.TK["WTI"]]
-    if all(c in h for c in cols):
+    if C.data_ok(h) and all(c in h for c in cols):
         o = h[cols].dropna().tail(120)
         o.columns = ["Brent", "WTI"]
         st.line_chart(o, height=260)
