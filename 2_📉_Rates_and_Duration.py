@@ -6,11 +6,20 @@ import streamlit as st
 import core as C
 
 st.set_page_config(page_title="Rates & Duration", page_icon="📉", layout="wide")
+
+if getattr(C, "VERSION", 1) < 2:
+    st.error("`core.py` is out of date — replace it in the repo root and push again.")
+    st.stop()
 st.title("📉 Rates & Duration")
 st.caption("Why this page exists: crypto is a long-duration asset. The 30Y is "
            "closer to its true discount rate than fed funds is.")
 
 series = {k: C.fred(k) for k in C.FRED}
+
+if all(df.empty for df in series.values()):
+    st.error("FRED is unreachable right now — no yield data. "
+             "Open 🔧 Diagnostics and press re-fetch.")
+    st.stop()
 
 # ------------------------------------------------------------- headline row
 cols = st.columns(5)
