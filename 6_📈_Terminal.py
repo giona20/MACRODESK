@@ -13,6 +13,10 @@ import core as C
 
 st.set_page_config(page_title="Terminal", page_icon="📈", layout="wide")
 
+if getattr(C, "VERSION", 1) < 2:
+    st.error("`core.py` is out of date — replace it in the repo root and push again.")
+    st.stop()
+
 # ------------------------------------------------------------------ styling
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
