@@ -37,9 +37,9 @@ st.markdown(
 # ------------------------------------------------------------------ universe
 UNIVERSE = {
     "RATES": {
-        "US30Y": ("^TYX", "30Y yield ⭐ crypto's discount rate", 10),
-        "US10Y": ("^TNX", "10Y yield", 10),
-        "US05Y": ("^FVX", "5Y yield", 10),
+        "US30Y": ("^TYX", "30Y yield ⭐ crypto's discount rate", 1),
+        "US10Y": ("^TNX", "10Y yield", 1),
+        "US05Y": ("^FVX", "5Y yield", 1),
     },
     "MACRO": {
         "DXY": ("DX-Y.NYB", "Dollar index — up = crypto headwind", 1),
@@ -71,14 +71,35 @@ TFS = {
 
 @st.cache_data(ttl=300, show_spinner=False)
 def ohlc(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    """Yahoo first; Stooq daily fallback so the terminal never goes blank."""
     try:
         df = yf.download(symbol, period=period, interval=interval,
-                         progress=False, auto_adjust=False)
+                         progress=False, auto_adjust=False, threads=False)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        return df.dropna()
+        df = df.dropna()
+        if not df.empty:
+            return _fix_scale(df, symbol)
     except Exception:
-        return pd.DataFrame()
+        pass
+    alt = C.STOOQ.get(symbol)
+    if alt:
+        d = C.stooq(alt)
+        if not d.empty and {"Open", "High", "Low", "Close"} <= set(d.columns):
+            n = {"1d": 5, "5d": 10, "1mo": 30, "3mo": 90,
+                 "6mo": 180, "1y": 365}.get(period, 120)
+            return _fix_scale(d.tail(n), symbol)
+    return pd.DataFrame()
+
+
+def _fix_scale(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Yield tickers occasionally quote %x10 — auto-detect and correct."""
+    if symbol in ("^TYX", "^TNX", "^FVX") and not df.empty:
+        if float(df["Close"].iloc[-1]) > 20:
+            for c in ("Open", "High", "Low", "Close"):
+                if c in df:
+                    df[c] = df[c] / 10
+    return df
 
 
 def spark(vals: list[float], width: int = 28) -> str:
@@ -107,6 +128,7 @@ st.divider()
 st.markdown("<div class='term-sub'>▌ TAPE</div>", unsafe_allow_html=True)
 strip = st.columns(6)
 i = 0
+_loaded = 0
 for sym, (tkr, desc, div) in FLAT.items():
     df = ohlc(tkr, period, interval)
     if df.empty or "Close" not in df:
@@ -127,6 +149,13 @@ for sym, (tkr, desc, div) in FLAT.items():
             f"<span class='bar {cls}'>{spark(s.tolist())}</span></div>",
             unsafe_allow_html=True)
     i += 1
+    _loaded += 1
+
+if _loaded == 0:
+    st.error("### ⚠️ No chart data\n"
+             "Yahoo and Stooq both failed. Open 🔧 Diagnostics and press "
+             "*Clear cache and re-fetch*, or redeploy for a fresh IP.")
+    st.stop()
 
 st.divider()
 
@@ -259,5 +288,5 @@ if not h.empty:
                        "trading as a tech proxy, not decoupled. Low/negative = "
                        "crypto running on its own flow.")
 
-st.caption("Charts: yfinance delayed. Yields divided by 10 (^TYX/^TNX quote %×10). "
+st.caption("Charts: Yahoo (delayed) with Stooq fallback. Yield scaling auto-corrected. "
            "Not investment advice.")
