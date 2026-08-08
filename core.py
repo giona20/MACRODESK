@@ -1,57 +1,67 @@
 """
-MACRODESK — shared data layer.
-All sources free / keyless: yfinance, FRED CSV, Google News RSS, GDELT,
-Polymarket Gamma, CoinGecko public, Hyperliquid public API, Farside (scrape).
-Every fetcher fails soft: returns empty, never raises into the UI.
+MACRODESK — shared data layer (resilient multi-source).
+
+Design rule: NO SILENT FAILURES. Every fetch records status in FEED_LOG so the
+Diagnostics page can show exactly what's alive. Every source has a fallback:
+
+  yields  : FRED CSV  -> Stooq CSV  -> yfinance
+  crypto  : CoinGecko -> Binance    -> yfinance
+  equities: yfinance  -> Stooq CSV
+  news    : Google RSS ; GDELT ; Polymarket Gamma  (all keyless)
 """
 from __future__ import annotations
 
 import datetime as dt
 import io
 import json
-import re
 from urllib.parse import quote_plus
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import yfinance as yf
 
-UA = {"User-Agent": "Mozilla/5.0 (MacroDesk dashboard; personal use)"}
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0 Safari/537.36"}
+
+# feed status -> {name: (ok: bool, detail: str)}
+if "FEED_LOG" not in st.session_state:
+    st.session_state.FEED_LOG = {}
+
+
+def _log(name: str, ok: bool, detail: str = "") -> None:
+    try:
+        st.session_state.FEED_LOG[name] = (ok, detail)
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------- symbols
 TK = {
-    # rates (the spine)
-    "US30Y": "^TYX",      # 30-year yield  (TVC:US30Y equivalent)
-    "US10Y": "^TNX",      # 10-year yield
-    "US02Y": "^FVX",      # 5y proxy; 2y via FRED below (yf has no clean ^IRX 2y)
-    # macro
-    "DXY": "DX-Y.NYB",
-    "VIX": "^VIX",
-    "GOLD": "GC=F",
-    "BRENT": "BZ=F",
-    "WTI": "CL=F",
-    "SPX": "^GSPC",
-    "NDX": "^NDX",
-    # crypto
-    "BTC": "BTC-USD",
-    "ETH": "ETH-USD",
+    "US30Y": "^TYX", "US10Y": "^TNX", "US05Y": "^FVX",
+    "DXY": "DX-Y.NYB", "VIX": "^VIX", "GOLD": "GC=F",
+    "BRENT": "BZ=F", "WTI": "CL=F", "SPX": "^GSPC", "NDX": "^NDX",
+    "BTC": "BTC-USD", "ETH": "ETH-USD",
+}
+# Stooq fallback symbols (free CSV, no key, no rate limit)
+STOOQ = {
+    "^TYX": "30usy.b", "^TNX": "10usy.b", "^FVX": "5usy.b",
+    "^GSPC": "^spx", "^NDX": "^ndx", "^VIX": "^vix",
+    "GC=F": "xauusd", "BZ=F": "cb.f", "CL=F": "cl.f",
+    "BTC-USD": "btcusd", "ETH-USD": "ethusd", "DX-Y.NYB": "dx.f",
 }
 TANKERS = ["FRO", "STNG", "TNK", "INSW"]
 DEFENSE = ["LMT", "RTX", "NOC", "GD"]
 
-# FRED series (CSV endpoint is public, no key)
 FRED = {
-    "DGS30": "30Y Treasury",
-    "DGS10": "10Y Treasury",
-    "DGS2": "2Y Treasury",
-    "T10YIE": "10Y breakeven inflation",
-    "T5YIFR": "5y5y forward inflation",
+    "DGS30": "30Y Treasury", "DGS10": "10Y Treasury", "DGS2": "2Y Treasury",
+    "T10YIE": "10Y breakeven inflation", "T5YIFR": "5y5y forward inflation",
     "THREEFYTP10": "10Y term premium (ACM)",
 }
+# FRED id for each yfinance yield ticker (preferred source)
+FRED_FOR = {"^TYX": "DGS30", "^TNX": "DGS10", "^FVX": "DGS5"}
 
-# ---- key levels from the playbook (edit here, propagates everywhere)
 LEVELS = {
     "BTC": {"support": [63800, 61800, 56000], "resistance": [65135, 67300, 70000],
             "note": "63.8K break point · 65.1K 50d EMA · 67.3K regime change"},
@@ -78,8 +88,7 @@ CPI_GRID = [
 
 EVENTS = [
     ("2026-08-11 12:00", "NFIB small business", "🟡", "Prices/hiring sub-indices"),
-    ("2026-08-11 18:00", "Cleveland Fed nowcast (final)", "🟠",
-     "Best single pre-CPI estimate"),
+    ("2026-08-11 18:00", "Cleveland Fed nowcast (final)", "🟠", "Best pre-CPI estimate"),
     ("2026-08-12 14:30", "JULY CPI", "🔴", "THE PRINT — core m/m is the number"),
     ("2026-08-13 14:30", "July PPI", "🟠", "Input costs — confirms/denies CPI"),
     ("2026-08-14 14:30", "Retail Sales", "🟡", "Gas crowding out discretionary?"),
@@ -95,82 +104,174 @@ EVENTS = [
 ]
 
 
-# ---------------------------------------------------------------- fetchers
-@st.cache_data(ttl=300, show_spinner=False)
-def market(days: int = 180) -> pd.DataFrame:
-    syms = list(TK.values()) + TANKERS + DEFENSE
+# ---------------------------------------------------------------- primitives
+@st.cache_data(ttl=1800, show_spinner=False)
+def stooq(symbol: str) -> pd.DataFrame:
+    """Stooq free CSV — no key, no rate limit. Returns OHLC df indexed by date."""
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
     try:
-        end = dt.datetime.utcnow()
-        df = yf.download(syms, start=end - dt.timedelta(days=days), end=end,
-                         progress=False, auto_adjust=True)["Close"]
-        if isinstance(df, pd.Series):
-            df = df.to_frame()
-        return df.dropna(how="all")
-    except Exception:
+        r = requests.get(url, headers=UA, timeout=15)
+        if r.status_code != 200 or "Date" not in r.text[:200]:
+            _log(f"stooq:{symbol}", False, f"HTTP {r.status_code}")
+            return pd.DataFrame()
+        df = pd.read_csv(io.StringIO(r.text))
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date").sort_index()
+        _log(f"stooq:{symbol}", True, f"{len(df)} rows")
+        return df
+    except Exception as e:
+        _log(f"stooq:{symbol}", False, type(e).__name__)
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fred(series: str, obs: int = 400) -> pd.DataFrame:
-    """FRED public CSV — no API key."""
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
+def fred(series: str, obs: int = 500) -> pd.DataFrame:
+    for host in ("https://fred.stlouisfed.org/graph/fredgraph.csv?id=",
+                 "https://www.stlouisfed.org/-/media/fred/graph/fredgraph.csv?id="):
+        try:
+            r = requests.get(host + series, headers=UA, timeout=15)
+            if r.status_code != 200 or "," not in r.text[:200]:
+                continue
+            df = pd.read_csv(io.StringIO(r.text))
+            df.columns = ["date", "value"]
+            df["date"] = pd.to_datetime(df["date"])
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+            df = df.dropna().tail(obs).reset_index(drop=True)
+            _log(f"fred:{series}", True, f"{len(df)} rows")
+            return df
+        except Exception as e:
+            _log(f"fred:{series}", False, type(e).__name__)
+    _log(f"fred:{series}", False, "all hosts failed")
+    return pd.DataFrame(columns=["date", "value"])
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def yahoo(symbols: list[str], days: int) -> pd.DataFrame:
     try:
-        r = requests.get(url, headers=UA, timeout=15)
-        df = pd.read_csv(io.StringIO(r.text))
-        df.columns = ["date", "value"]
-        df["date"] = pd.to_datetime(df["date"])
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        return df.dropna().tail(obs).reset_index(drop=True)
-    except Exception:
-        return pd.DataFrame(columns=["date", "value"])
+        import yfinance as yf
+        end = dt.datetime.utcnow()
+        df = yf.download(symbols, start=end - dt.timedelta(days=days), end=end,
+                         progress=False, auto_adjust=True, threads=False)
+        if df is None or df.empty:
+            _log("yfinance", False, "empty response (Yahoo may be blocking)")
+            return pd.DataFrame()
+        close = df["Close"] if "Close" in df else df
+        if isinstance(close, pd.Series):
+            close = close.to_frame()
+        close = close.dropna(how="all")
+        _log("yfinance", not close.empty,
+             f"{close.shape[1]} symbols, {len(close)} rows")
+        return close
+    except Exception as e:
+        _log("yfinance", False, f"{type(e).__name__}: {e}"[:90])
+        return pd.DataFrame()
+
+
+def _norm_yield(s: pd.Series) -> pd.Series:
+    """yfinance yield tickers sometimes quote %*10. Auto-detect and normalise."""
+    s = s.dropna()
+    if len(s) and s.iloc[-1] > 20:
+        return s / 10
+    return s
+
+
+# ---------------------------------------------------------------- market
+@st.cache_data(ttl=600, show_spinner=False)
+def market(days: int = 240) -> pd.DataFrame:
+    """Close prices for everything. Yahoo first, Stooq fills any gaps.
+    Yields are ALWAYS normalised to percent (5.22 = 5.22%)."""
+    want = list(TK.values()) + TANKERS + DEFENSE
+    out = yahoo(want, days)
+
+    missing = [s for s in want if s not in out.columns
+               or out[s].dropna().empty]
+    filled = []
+    for sym in missing:
+        alt = STOOQ.get(sym)
+        if not alt:
+            continue
+        d = stooq(alt)
+        if not d.empty and "Close" in d:
+            out = out.join(d["Close"].rename(sym), how="outer") \
+                if not out.empty else d[["Close"]].rename(columns={"Close": sym})
+            filled.append(sym)
+
+    # yields: prefer FRED (cleanest), else normalise whatever we have
+    for tkr, fid in FRED_FOR.items():
+        f = fred(fid)
+        if not f.empty:
+            s = f.set_index("date")["value"]
+            out = out.drop(columns=[tkr], errors="ignore")
+            out = out.join(s.rename(tkr), how="outer") if not out.empty \
+                else s.rename(tkr).to_frame()
+        elif tkr in out.columns:
+            out[tkr] = _norm_yield(out[tkr])
+
+    if filled:
+        _log("stooq-fallback", True, f"filled {len(filled)}: {','.join(filled[:6])}")
+    if out.empty:
+        _log("market", False, "ALL SOURCES FAILED")
+    else:
+        out = out.sort_index()
+        _log("market", True, f"{out.shape[1]} cols, {len(out)} rows")
+    return out
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def crypto_spot() -> dict:
-    """CoinGecko public endpoint — BTC/ETH/HYPE spot + 24h."""
-    out = {}
+    """CoinGecko -> Binance fallback."""
     try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "bitcoin,ethereum,hyperliquid",
-                    "vs_currencies": "usd",
-                    "include_24hr_change": "true",
-                    "include_24hr_vol": "true"},
-            headers=UA, timeout=12)
-        js = r.json()
-        m = {"bitcoin": "BTC", "ethereum": "ETH", "hyperliquid": "HYPE"}
-        for k, v in m.items():
-            if k in js:
-                out[v] = {"price": js[k].get("usd"),
-                          "chg": js[k].get("usd_24h_change"),
-                          "vol": js[k].get("usd_24h_vol")}
-    except Exception:
-        pass
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price",
+                         params={"ids": "bitcoin,ethereum,hyperliquid",
+                                 "vs_currencies": "usd",
+                                 "include_24hr_change": "true"},
+                         headers=UA, timeout=12)
+        if r.status_code == 200:
+            js = r.json()
+            m = {"bitcoin": "BTC", "ethereum": "ETH", "hyperliquid": "HYPE"}
+            out = {v: {"price": js[k].get("usd"), "chg": js[k].get("usd_24h_change")}
+                   for k, v in m.items() if k in js}
+            if out:
+                _log("coingecko", True, f"{len(out)} coins")
+                return out
+        _log("coingecko", False, f"HTTP {r.status_code}")
+    except Exception as e:
+        _log("coingecko", False, type(e).__name__)
+
+    out = {}
+    for sym, pair in (("BTC", "BTCUSDT"), ("ETH", "ETHUSDT"), ("HYPE", "HYPEUSDT")):
+        try:
+            r = requests.get("https://api.binance.com/api/v3/ticker/24hr",
+                             params={"symbol": pair}, headers=UA, timeout=10)
+            if r.status_code == 200:
+                j = r.json()
+                out[sym] = {"price": float(j["lastPrice"]),
+                            "chg": float(j["priceChangePercent"])}
+        except Exception:
+            pass
+    _log("binance", bool(out), f"{len(out)} coins")
     return out
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def hyperliquid_meta() -> pd.DataFrame:
-    """Hyperliquid public info API — funding, OI, mark px for perps."""
     try:
         r = requests.post("https://api.hyperliquid.xyz/info",
                           json={"type": "metaAndAssetCtxs"},
                           headers={**UA, "Content-Type": "application/json"},
                           timeout=12)
         meta, ctxs = r.json()
-        rows = []
-        for u, c in zip(meta["universe"], ctxs):
-            rows.append({
-                "coin": u["name"],
-                "mark": float(c.get("markPx") or 0),
-                "funding": float(c.get("funding") or 0) * 100,   # % per hour
-                "oi": float(c.get("openInterest") or 0),
-                "vol24h": float(c.get("dayNtlVlm") or 0),
-            })
+        rows = [{"coin": u["name"], "mark": float(c.get("markPx") or 0),
+                 "funding": float(c.get("funding") or 0) * 100,
+                 "oi": float(c.get("openInterest") or 0),
+                 "vol24h": float(c.get("dayNtlVlm") or 0)}
+                for u, c in zip(meta["universe"], ctxs)]
         df = pd.DataFrame(rows)
         df["oi_usd"] = df["oi"] * df["mark"]
+        _log("hyperliquid", True, f"{len(df)} perps")
         return df.sort_values("vol24h", ascending=False)
-    except Exception:
+    except Exception as e:
+        _log("hyperliquid", False, type(e).__name__)
         return pd.DataFrame()
 
 
@@ -195,10 +296,10 @@ def polymarket(terms: tuple[str, ...]) -> list[dict]:
                     yes = None
                 out.append({"q": m.get("question"), "yes": yes,
                             "vol": float(m.get("volume24hr") or 0),
-                            "url": "https://polymarket.com/event/" +
-                                   (m.get("slug") or "")})
-    except Exception:
-        pass
+                            "url": "https://polymarket.com/event/" + (m.get("slug") or "")})
+        _log("polymarket", True, f"{len(out)} matched")
+    except Exception as e:
+        _log("polymarket", False, type(e).__name__)
     return sorted(out, key=lambda x: -x["vol"])[:12]
 
 
@@ -206,186 +307,179 @@ def polymarket(terms: tuple[str, ...]) -> list[dict]:
 def news(keyword: str, n: int = 6) -> list[dict]:
     try:
         import feedparser
-        url = (f"https://news.google.com/rss/search?q={quote_plus(keyword)}"
-               "&hl=en-US&gl=US&ceid=US:en")
-        f = feedparser.parse(url)
-        return [{"title": e.get("title", ""), "link": e.get("link", ""),
-                 "pub": e.get("published", ""), "kw": keyword}
-                for e in f.entries[:n]]
-    except Exception:
+        f = feedparser.parse(
+            f"https://news.google.com/rss/search?q={quote_plus(keyword)}"
+            "&hl=en-US&gl=US&ceid=US:en")
+        res = [{"title": e.get("title", ""), "link": e.get("link", ""),
+                "pub": e.get("published", ""), "kw": keyword} for e in f.entries[:n]]
+        _log("googlenews", bool(res), f"{len(res)} items")
+        return res
+    except Exception as e:
+        _log("googlenews", False, type(e).__name__)
         return []
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def gdelt(query: str, days: int = 45) -> pd.DataFrame:
-    url = ("https://api.gdeltproject.org/api/v2/doc/doc"
-           f"?query={quote_plus(query)}&mode=timelinevol"
-           f"&timespan={days}d&format=json")
     try:
-        js = requests.get(url, headers=UA, timeout=15).json()
+        js = requests.get("https://api.gdeltproject.org/api/v2/doc/doc"
+                          f"?query={quote_plus(query)}&mode=timelinevol"
+                          f"&timespan={days}d&format=json",
+                          headers=UA, timeout=15).json()
         df = pd.DataFrame(js["timeline"][0]["data"])
         df["date"] = pd.to_datetime(df["date"])
+        _log("gdelt", True, f"{len(df)} points")
         return df.rename(columns={"value": "vol"})[["date", "vol"]]
-    except Exception:
+    except Exception as e:
+        _log("gdelt", False, type(e).__name__)
         return pd.DataFrame(columns=["date", "vol"])
 
 
 # ---------------------------------------------------------------- helpers
+def series(h: pd.DataFrame, key: str) -> pd.Series:
+    """Safe accessor by friendly name ('US30Y','BTC'). Always percent for yields."""
+    col = TK.get(key, key)
+    if h is None or h.empty or col not in h.columns:
+        return pd.Series(dtype=float)
+    return h[col].dropna()
+
+
 def chg(s: pd.Series, d: int) -> float:
     s = s.dropna()
     return np.nan if len(s) <= d else (s.iloc[-1] / s.iloc[-1 - d] - 1) * 100
 
 
-def bps(s: pd.Series, d: int) -> float:
-    """Yield change in basis points (yf yields are in %*10 for ^TYX/^TNX)."""
-    s = s.dropna()
-    return np.nan if len(s) <= d else (s.iloc[-1] - s.iloc[-1 - d]) * 10
-
-
 def scale(x, lo, hi):
-    return np.nan if (x is None or np.isnan(x)) else float(np.clip((x - lo) / (hi - lo), 0, 1))
+    try:
+        if x is None or np.isnan(x):
+            return np.nan
+    except TypeError:
+        return np.nan
+    return float(np.clip((x - lo) / (hi - lo), 0, 1))
 
 
 def basket(h: pd.DataFrame, t: list[str]) -> pd.Series:
-    c = [x for x in t if x in h.columns]
+    c = [x for x in t if h is not None and not h.empty and x in h.columns]
     return h[c].mean(axis=1) if c else pd.Series(dtype=float)
+
+
+def data_ok(h: pd.DataFrame) -> bool:
+    return h is not None and not h.empty and h.shape[1] >= 3
 
 
 # ---------------------------------------------------------------- indicators
 def duration_stress(h: pd.DataFrame, tp: pd.DataFrame) -> dict:
-    """DURATION STRESS INDEX (0-100) — the core proprietary indicator.
-
-    Answers: how hostile is the long end to risk assets right now?
-    High = crypto's discount rate is bad regardless of Fed meeting odds.
-      40% 30Y level (4.0-5.5% band)
-      25% 30Y 10d momentum (is it still selling off?)
-      20% 2s30s steepening (bear steepener = credibility problem)
-      15% 10y breakeven (market inflation expectation)
-    """
     comp, notes = {}, {}
-    y30 = h.get(TK["US30Y"], pd.Series(dtype=float)).dropna() / 10  # ^TYX -> %
-    y10 = h.get(TK["US10Y"], pd.Series(dtype=float)).dropna() / 10
+    y30 = series(h, "US30Y")
 
     lvl = y30.iloc[-1] if len(y30) else np.nan
     comp["30Y level"] = scale(lvl, 4.0, 5.5)
-    notes["30Y level"] = f"{lvl:.2f}%" if not np.isnan(lvl) else "n/a"
+    notes["30Y level"] = f"{lvl:.2f}%" if len(y30) else "no data"
 
     mom = (y30.iloc[-1] - y30.iloc[-11]) * 100 if len(y30) > 11 else np.nan
     comp["30Y momentum"] = scale(mom, -20, 30)
-    notes["30Y momentum"] = f"{mom:+.0f}bp / 10d" if not np.isnan(mom) else "n/a"
+    notes["30Y momentum"] = f"{mom:+.0f}bp / 10d" if not np.isnan(mom) else "no data"
 
-    # 2s30s via FRED (yf lacks a clean 2y)
-    d2 = fred("DGS2"); d30 = fred("DGS30")
+    d2, d30 = fred("DGS2"), fred("DGS30")
     steep = np.nan
-    if not d2.empty and not d30.empty:
+    if not d2.empty and not d30.empty and len(d2) > 11 and len(d30) > 11:
         cur = d30["value"].iloc[-1] - d2["value"].iloc[-1]
-        prv = (d30["value"].iloc[-11] - d2["value"].iloc[-11]
-               if len(d2) > 11 and len(d30) > 11 else np.nan)
-        steep = (cur - prv) * 100 if not np.isnan(prv) else np.nan
-        notes["2s30s steepening"] = (f"curve {cur:.2f}% ({steep:+.0f}bp/10d)"
-                                     if not np.isnan(steep) else f"curve {cur:.2f}%")
+        prv = d30["value"].iloc[-11] - d2["value"].iloc[-11]
+        steep = (cur - prv) * 100
+        notes["2s30s steepening"] = f"curve {cur:.2f}% ({steep:+.0f}bp/10d)"
     else:
-        notes["2s30s steepening"] = "n/a"
+        notes["2s30s steepening"] = "no data"
     comp["2s30s steepening"] = scale(steep, -20, 40)
 
-    be = np.nan
-    if not tp.empty:
-        be = tp["value"].iloc[-1]
+    be = tp["value"].iloc[-1] if (tp is not None and not tp.empty) else np.nan
     comp["Inflation expectations"] = scale(be, 2.0, 3.2)
-    notes["Inflation expectations"] = f"10y breakeven {be:.2f}%" if not np.isnan(be) else "n/a"
+    notes["Inflation expectations"] = (f"10y breakeven {be:.2f}%"
+                                       if not np.isnan(be) else "no data")
 
     w = {"30Y level": .40, "30Y momentum": .25,
          "2s30s steepening": .20, "Inflation expectations": .15}
     tot = ws = 0.0
     for k, wt in w.items():
-        if not np.isnan(comp.get(k, np.nan)):
-            tot += comp[k] * wt; ws += wt
+        v = comp.get(k, np.nan)
+        if not (v is None or np.isnan(v)):
+            tot += v * wt; ws += wt
     return {"index": round(tot / ws * 100) if ws else None,
-            "components": comp, "notes": notes, "weights": w}
+            "components": comp, "notes": notes, "weights": w,
+            "coverage": round(ws * 100)}
 
 
 def hormuz_risk(h: pd.DataFrame, g: pd.DataFrame) -> dict:
-    """CHOKEPOINT sub-index (0-100) — war/energy premium."""
     comp, notes = {}, {}
-    b = h.get(TK["BRENT"], pd.Series(dtype=float))
-    w_ = h.get(TK["WTI"], pd.Series(dtype=float))
+    b, w_ = series(h, "BRENT"), series(h, "WTI")
     bm = chg(b, 5)
-    sp = (b.dropna().iloc[-1] - w_.dropna().iloc[-1]
-          if len(b.dropna()) and len(w_.dropna()) else np.nan)
+    sp = (b.iloc[-1] - w_.iloc[-1]) if (len(b) and len(w_)) else np.nan
     comp["Oil momentum"] = scale(bm, -5, 10)
-    notes["Oil momentum"] = f"Brent 5d {bm:+.1f}% · spread ${sp:.2f}" if not np.isnan(bm) else "n/a"
+    notes["Oil momentum"] = (f"Brent 5d {bm:+.1f}% · spread ${sp:.2f}"
+                             if not np.isnan(bm) else "no data")
 
     tk = chg(basket(h, TANKERS), 5)
     comp["Tanker premium"] = scale(tk, -5, 12)
-    notes["Tanker premium"] = f"{tk:+.1f}% 5d" if not np.isnan(tk) else "n/a"
+    notes["Tanker premium"] = f"{tk:+.1f}% 5d" if not np.isnan(tk) else "no data"
 
     df_ = chg(basket(h, DEFENSE), 10)
     comp["Defense bid"] = scale(df_, -5, 8)
-    notes["Defense bid"] = f"{df_:+.1f}% 10d" if not np.isnan(df_) else "n/a"
+    notes["Defense bid"] = f"{df_:+.1f}% 10d" if not np.isnan(df_) else "no data"
 
-    if not g.empty:
+    if g is not None and not g.empty:
         v = g["vol"]
         comp["News intensity"] = scale(v.iloc[-1], v.min(), v.max())
         notes["News intensity"] = f"{v.iloc[-1]:.2f} (range {v.min():.2f}–{v.max():.2f})"
     else:
-        comp["News intensity"] = np.nan; notes["News intensity"] = "n/a"
+        comp["News intensity"] = np.nan; notes["News intensity"] = "no data"
 
     w = {"Oil momentum": .40, "Tanker premium": .25,
          "Defense bid": .15, "News intensity": .20}
     tot = ws = 0.0
     for k, wt in w.items():
-        if not np.isnan(comp.get(k, np.nan)):
-            tot += comp[k] * wt; ws += wt
+        v = comp.get(k, np.nan)
+        if not (v is None or np.isnan(v)):
+            tot += v * wt; ws += wt
     return {"index": round(tot / ws * 100) if ws else None,
-            "components": comp, "notes": notes, "weights": w}
+            "components": comp, "notes": notes, "weights": w,
+            "coverage": round(ws * 100)}
 
 
-def regime(dur: int | None, horm: int | None, btc_chg: float | None) -> tuple[str, str, str]:
-    """Melt the engines into one regime label."""
+def regime(dur, horm, btc_chg=None):
     if dur is None:
-        return "NO DATA", "gray", "Feeds unavailable."
+        return "NO DATA", "gray", "Feeds unavailable — see Diagnostics page."
     if dur >= 70 and (horm or 0) >= 55:
         return ("FULL BEAR", "#c62828",
-                "Duration hostile + war premium. Long-duration assets punished. "
-                "Short bias, wide MM, no grid.")
+                "Duration hostile + war premium. Short bias, wide MM, no grid.")
     if dur >= 70:
         return ("DURATION SQUEEZE", "#ef6c00",
-                "Long end hostile regardless of Fed odds. Fade crypto pops — "
-                "the 4/4 rule is live.")
+                "Long end hostile regardless of Fed odds. Fade crypto pops.")
     if dur >= 45:
         return ("TENSE / RANGE", "#f9a825",
                 "Nothing resolved. Chop favours MM, punishes directional size.")
-    if dur < 45 and (horm or 0) < 40:
+    if (horm or 0) < 40:
         return ("RELIEF", "#2e7d32",
-                "Term premium compressing + war premium deflating. "
-                "This is the regime where crypto rallies stick.")
+                "Term premium compressing + war premium deflating. Rallies stick.")
     return ("MIXED", "#f9a825", "Engines disagree — reduce size, wait for alignment.")
 
 
 def fade_rule(h: pd.DataFrame) -> tuple[bool, str]:
-    """THE ONE RULE: did the 30Y rally today? If not, fade crypto pops."""
-    y30 = h.get(TK["US30Y"], pd.Series(dtype=float)).dropna() / 10
-    btc = h.get(TK["BTC"], pd.Series(dtype=float)).dropna()
+    y30, btc = series(h, "US30Y"), series(h, "BTC")
     if len(y30) < 2 or len(btc) < 2:
-        return False, "insufficient data"
+        return False, "insufficient data — check Diagnostics"
     dy = (y30.iloc[-1] - y30.iloc[-2]) * 100
     db = (btc.iloc[-1] / btc.iloc[-2] - 1) * 100
     if db > 0.8 and dy > -2:
         return True, (f"BTC {db:+.1f}% but 30Y {dy:+.0f}bp — "
                       "pop NOT confirmed by the long end. FADE.")
-    if db > 0.8 and dy <= -2:
+    if db > 0.8:
         return False, (f"BTC {db:+.1f}% and 30Y {dy:+.0f}bp — "
                        "confirmed by duration. Real move.")
     return False, f"BTC {db:+.1f}% · 30Y {dy:+.0f}bp — no signal."
 
 
-def level_proximity(price: float, sym: str) -> list[dict]:
-    """Distance to each key level, sorted by nearness."""
+def level_proximity(price, sym: str) -> list[dict]:
     if not price or sym not in LEVELS:
         return []
-    out = []
-    for kind in ("support", "resistance"):
-        for lv in LEVELS[sym][kind]:
-            out.append({"level": lv, "kind": kind,
-                        "dist_pct": (lv / price - 1) * 100})
+    out = [{"level": lv, "kind": k, "dist_pct": (lv / price - 1) * 100}
+           for k in ("support", "resistance") for lv in LEVELS[sym][k]]
     return sorted(out, key=lambda x: abs(x["dist_pct"]))
