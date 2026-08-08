@@ -7,10 +7,21 @@ import streamlit as st
 import core as C
 
 st.set_page_config(page_title="Crypto & Hyperliquid", page_icon="₿", layout="wide")
+
+if getattr(C, "VERSION", 1) < 2:
+    st.error("`core.py` is out of date — replace it in the repo root and push again.")
+    st.stop()
 st.title("₿ Crypto & Hyperliquid")
 
 spot = C.crypto_spot()
 hl = C.hyperliquid_meta()
+
+if not spot and hl.empty:
+    st.error("No crypto data source responded (CoinGecko, Binance and "
+             "Hyperliquid all failed). See 🔧 Diagnostics.")
+    st.stop()
+if not spot:
+    st.warning("Spot feed down — showing Hyperliquid perp marks only.")
 
 # ------------------------------------------------------------- spot + levels
 cols = st.columns(3)
@@ -83,7 +94,7 @@ st.divider()
 # ------------------------------------------------------------- BTC/ETH ratio
 st.subheader("ETH/BTC — the pair trade")
 h = C.market()
-if C.TK["BTC"] in h and C.TK["ETH"] in h:
+if C.data_ok(h) and C.TK["BTC"] in h and C.TK["ETH"] in h:
     r = (h[C.TK["ETH"]] / h[C.TK["BTC"]]).dropna().tail(180)
     f = go.Figure(go.Scatter(x=r.index, y=r.values, name="ETH/BTC"))
     f.update_layout(height=280, margin=dict(t=20, b=20, l=40, r=20))
