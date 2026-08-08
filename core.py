@@ -21,6 +21,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
+VERSION = 2  # bump when core.py API changes
+
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/122.0 Safari/537.36"}
