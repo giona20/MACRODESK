@@ -7,6 +7,10 @@ import streamlit as st
 import core as C
 
 st.set_page_config(page_title="CPI Battle Plan", page_icon="🎯", layout="wide")
+
+if getattr(C, "VERSION", 1) < 2:
+    st.error("`core.py` is out of date — replace it in the repo root and push again.")
+    st.stop()
 st.title("🎯 CPI Battle Plan")
 
 CPI_TS = dt.datetime(2026, 8, 12, 14, 30)  # Rome
