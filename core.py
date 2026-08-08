@@ -389,4 +389,3 @@ def level_proximity(price: float, sym: str) -> list[dict]:
             out.append({"level": lv, "kind": kind,
                         "dist_pct": (lv / price - 1) * 100})
     return sorted(out, key=lambda x: abs(x["dist_pct"]))
-
